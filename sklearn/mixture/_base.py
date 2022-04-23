@@ -6,14 +6,14 @@
 
 import numbers
 import warnings
+from enum import Enum
 from abc import ABCMeta, abstractmethod
 from time import time
 
 import numpy as np
 from scipy.special import logsumexp
 
-from .. import cluster
-from ..cluster import kmeans_plusplus
+from ..cluster import KMeans, kmeans_plusplus
 from ..base import BaseEstimator
 from ..base import DensityMixin
 from ..exceptions import ConvergenceWarning
@@ -40,6 +40,24 @@ def _check_shape(param, param_shape, name):
         )
 
 
+def _prune_init_kwargs(init_callable, init_kwargs):
+    """Remove the keyword arguments that are not recognized by the init method.
+
+    Parameters
+    ----------
+    init_callable : callable
+        The initializer function.
+
+    init_kwargs : dict
+        The dictionary of keyword arguments passed to the init method.
+    """
+    # inspect.signature is slower than using __code__ and list comprehension:
+    # Both will fail to introspect builtin_function that is a C wrapper anyway.
+    co = init_callable.__code__
+    argument_names = co.co_varnames[:co.co_argcount+co.co_kwonlyargcount]
+    return {key: value for key, value in init_kwargs.items() if key in argument_names}
+
+
 class BaseMixture(DensityMixin, BaseEstimator, metaclass=ABCMeta):
     """Base class for mixture models.
 
@@ -55,6 +73,7 @@ class BaseMixture(DensityMixin, BaseEstimator, metaclass=ABCMeta):
         max_iter,
         n_init,
         init_params,
+        init_kwargs,
         random_state,
         warm_start,
         verbose,
@@ -66,6 +85,7 @@ class BaseMixture(DensityMixin, BaseEstimator, metaclass=ABCMeta):
         self.max_iter = max_iter
         self.n_init = n_init
         self.init_params = init_params
+        self.init_kwargs = init_kwargs
         self.random_state = random_state
         self.warm_start = warm_start
         self.verbose = verbose
@@ -99,6 +119,14 @@ class BaseMixture(DensityMixin, BaseEstimator, metaclass=ABCMeta):
             self.reg_covar, name="reg_covar", target_type=numbers.Real, min_val=0.0
         )
 
+        # Check valid 'init_params'.
+        if self.init_params in ['k-means++','kmeans++','k_means++']:
+            self.init_params = 'kmeans_plusplus'
+        if not Initializer.check(self.init_params):
+            raise ValueError(
+                f"`init_param`= {self.init_params} is not supported as initializer."
+            )
+
         # Check all the parameters values of the derived class
         self._check_parameters(X)
 
@@ -125,16 +153,37 @@ class BaseMixture(DensityMixin, BaseEstimator, metaclass=ABCMeta):
         """
         n_samples, _ = X.shape
 
-        if self.init_params == "kmeans":
+        # Get initializer callable
+        initializer = Initializer[self.init_params]
+        initializer_func = initializer.value.split('.')
+        scope = locals() if 'random_state' in initializer_func else globals()
+        initializer_func = getattr(scope, initializer_func[-1])
+        if isinstance(initializer_func, type):
+            initializer_func = initializer_func.__init__
+
+        # check init_kwargs and drop keys that are not defined
+        if self.init_kwargs is None:
+            self.init_kwargs = {}
+        if 'n_clusters' in self.init_kwargs:
+            # Make sure to find `n_components` number of clusters.
+            self.init_kwargs['n_clusters'] = self.init_kwargs.get("n_clusters", self.n_components)
+
+
+        if 'kmeans' in initializer.value.lower():
+            kmeans_kwargs = {'n_clusters': self.n_components, 'n_init': 1, 'random_state': random_state}
             resp = np.zeros((n_samples, self.n_components))
-            label = (
-                cluster.KMeans(
-                    n_clusters=self.n_components, n_init=1, random_state=random_state
-                )
-                .fit(X)
-                .labels_
-            )
-            resp[np.arange(n_samples), label] = 1
+
+            if isinstance(initializer_func, type):
+                kwargs = _prune_init_kwargs(initializer_func.__init__, {**kmeans_kwargs, **self.init_kwargs})
+                resp[np.arange(n_samples), initializer_func.fit_predict(X, **kwargs)] = 1
+            else:
+                kwargs = _prune_init_kwargs(initializer_func, {**kmeans_kwargs, **self.init_kwargs})
+                resp[initializer_func(X, **kwargs)[1], np.arange(self.n_components)] = 1
+
+        elif 'random_state' in initializer.value.lower():
+            random_kwargs = {'size'}
+            {key: value for key, value in init_kwargs.items() if key in argument_names}
+
         elif self.init_params == "random":
             resp = random_state.uniform(size=(n_samples, self.n_components))
             resp /= resp.sum(axis=1)[:, np.newaxis]
@@ -144,14 +193,7 @@ class BaseMixture(DensityMixin, BaseEstimator, metaclass=ABCMeta):
                 n_samples, size=self.n_components, replace=False
             )
             resp[indices, np.arange(self.n_components)] = 1
-        elif self.init_params == "k-means++":
-            resp = np.zeros((n_samples, self.n_components))
-            _, indices = kmeans_plusplus(
-                X,
-                self.n_components,
-                random_state=random_state,
-            )
-            resp[indices, np.arange(self.n_components)] = 1
+
         else:
             raise ValueError(
                 "Unimplemented initialization method '%s'" % self.init_params
@@ -576,3 +618,25 @@ class BaseMixture(DensityMixin, BaseEstimator, metaclass=ABCMeta):
                 "Initialization converged: %s\t time lapse %.5fs\t ll %.5f"
                 % (self.converged_, time() - self._init_prev_time, ll)
             )
+
+class Initializer(Enum):
+    """
+    Enum for the different initializations of the parameters of the mixture.
+    """
+    kmeans = 'KMeans'
+    k_means_plusplus = 'kmeans_plusplus'
+    random = 'random_state.uniform'
+    random_from_data = 'random_state.choice'
+    # Misspellings:
+    KMeans = 'KMeans'
+    KMEANS = 'KMeans'
+    k_means = 'KMeans'
+    K_MEANS = 'KMeans'
+    K_Means = 'KMeans'
+    kmeans_plusplus = 'kmeans_plusplus'
+    kmeans_plus_plus = 'kmeans_plusplus'
+
+    @classmethod
+    def check(self, key):
+        return key in self.__members__
+

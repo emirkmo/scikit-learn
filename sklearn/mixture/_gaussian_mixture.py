@@ -507,6 +507,11 @@ class GaussianMixture(BaseMixture):
             `init_params` now accepts 'random_from_data' and 'k-means++' as
             initialization methods.
 
+    init_kwargs : dict, default=None
+        Keyword arguments to pass to the `init_params` method. Overrides default arguments.
+        If it is None, default arguments are used. Invalid kwargs for the given `init_params`
+        will be dropped.
+
     weights_init : array-like of shape (n_components, ), default=None
         The user-provided initial weights.
         If it is None, weights are initialized using the `init_params` method.
@@ -646,6 +651,7 @@ class GaussianMixture(BaseMixture):
         max_iter=100,
         n_init=1,
         init_params="kmeans",
+        init_kwargs=None,
         weights_init=None,
         means_init=None,
         precisions_init=None,
@@ -661,6 +667,7 @@ class GaussianMixture(BaseMixture):
             max_iter=max_iter,
             n_init=n_init,
             init_params=init_params,
+            init_kwargs=init_kwargs,
             random_state=random_state,
             warm_start=warm_start,
             verbose=verbose,
@@ -679,8 +686,7 @@ class GaussianMixture(BaseMixture):
             raise ValueError(
                 "Invalid value for 'covariance_type': %s "
                 "'covariance_type' should be in "
-                "['spherical', 'tied', 'diag', 'full']"
-                % self.covariance_type
+                "['spherical', 'tied', 'diag', 'full']" % self.covariance_type
             )
 
         if self.weights_init is not None:
